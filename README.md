@@ -18,7 +18,7 @@
 ## Architecture
 
 <p align="center">
-  <img src="assets/architecture.png" alt="OpenDecision architecture" width="100%">
+  <img src="assets/architecture.png" alt="OpenDecision architecture" width="720">
 </p>
 
 
