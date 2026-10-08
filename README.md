@@ -17,13 +17,10 @@
 
 ## Architecture
 
-```
-text (BPE) ──► embed ──► RoPE encoder (chunk-parallel for long inputs) ──► cached state h   (run ONCE per request)
-                                                                  │
-questions: option + instruction text (same encoder) + type emb ─► [opt self-attn ─► cross-attn(h) ─► FFN] x L ─► scorer ─► softmax (+ unknown slot)
-                                                                  │            (per question, cheap, parallel over Q and K)
-                                              choice / score(RPS) / noul ─► JSON probabilities
-```
+<p align="center">
+  <img src="assets/architecture.png" alt="OpenDecision architecture" width="100%">
+</p>
+
 
 Full design, FLOPs budget and per-modality SLAs: [docs/architecture.md](docs/architecture.md).
 
