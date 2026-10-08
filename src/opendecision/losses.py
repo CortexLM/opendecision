@@ -7,28 +7,29 @@ def _p(logits):
     return torch.softmax(logits, -1)
 
 
-def log_loss(logits, y):
-    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+def _red(l, reduction):
+    return l.mean() if reduction == "mean" else l
 
+def log_loss(logits, y, reduction="mean"):
+    l = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none").view(y.shape)
+    return _red(l, reduction)
 
-def brier(logits, y):
+def brier(logits, y, reduction="mean"):
     p = _p(logits)
     oh = F.one_hot(y, p.size(-1)).to(p.dtype)
-    return ((p - oh) ** 2).sum(-1).mean()
+    return _red(((p - oh) ** 2).sum(-1), reduction)
 
-
-def spherical(logits, y):
+def spherical(logits, y, reduction="mean"):
     p = _p(logits)
-    return -(p.gather(-1, y.unsqueeze(-1)).squeeze(-1) / p.norm(dim=-1)).mean()
+    oh = F.one_hot(y, p.size(-1)).to(p.dtype)
+    return _red(-((p * oh).sum(-1) / p.norm(dim=-1)), reduction)
 
-
-def rps(logits, y):
+def rps(logits, y, reduction="mean"):
     """Ranked probability score for ordinal `score` questions."""
     p = _p(logits)
     cp = p.cumsum(-1)
     co = F.one_hot(y, p.size(-1)).cumsum(-1).to(p.dtype)
-    return ((cp - co) ** 2).sum(-1).mean()
-
+    return _red(((cp - co) ** 2).sum(-1), reduction)
 
 def coherence(p_x, p_not_x, p_pair_a=None, p_pair_ab=None):
     """Label-free: P(X)+P(not X)=1 and P(A and B)<=min(P(A),P(B)). Inputs are probabilities."""

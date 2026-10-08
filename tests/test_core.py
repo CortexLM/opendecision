@@ -164,7 +164,9 @@ def test_unknown_mass_learnable_for_out_of_scope():
 def test_mlm_step_and_real_bpe_tokenizer():
     m = OpenDecisionModel(ModelConfig(d=64, layers=2, heads=2, head_layers=1)); opt = torch.optim.Adam(m.parameters(), 1e-3)
     x, mask = T.batch(["hello world " * 8] * 4, 64)
-    assert TR.mlm_step(m, opt, x, mask) > 0
+    x = x[:, :64]
+    from opendecision.masking import mask_positions
+    assert TR.mlm_step(m, opt, x, torch.from_numpy(mask_positions(x.numpy(), 0, 19))) > 0
     import pytest
     tk = pytest.importorskip("tokenizers")
     try:

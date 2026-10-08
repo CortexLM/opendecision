@@ -8,6 +8,7 @@ import torch
 
 PAD, MASK, CLS = 0, 1, 2
 OFFSET = 3
+MODEL_VOCAB = 50432   # ModernBERT-base 50368 + OFFSET 3 = 50371 ids, padded to a multiple of 64 (pin: answerdotai/ModernBERT-base tokenizer.json)
 
 
 class ByteTokenizer:

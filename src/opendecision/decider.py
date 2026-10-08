@@ -47,7 +47,7 @@ class Decider:
         ids = ids[: self.max_tokens]
         x = torch.tensor([ids], device=self.device)
         names, oid, om, ins, qt = self._pack(req.questions)
-        probs = torch.softmax(self.model(x, x != T.PAD, oid, om, ins, qt)[0], -1).cpu()
+        probs = torch.softmax(self.model(x, x != T.PAD, oid, om, ins, qt)[0][0], -1).cpu()
         out = {}
         for i, n in enumerate(names):
             q, p = req.questions[n], probs[i]
