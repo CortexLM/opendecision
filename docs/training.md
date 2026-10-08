@@ -1,0 +1,7 @@
+# Training
+
+1. **Pretrain** (`mlm_step`): text CLM then MLM (25/75, no LR decay between stages; 2507.00994 at 210M-1B, text-only, untested for vision-language). Staged data, specialist data late (SmolLM2). Vision/audio encoders start from permissive checkpoints (SigLIP2 Apache-2.0, Whisper MIT, CLAP Apache-2.0); avoid ImageNet-NC family (ImageBind, AudioMAE, VideoMAE are non-commercial).
+2. **Distill** (`distill_step`): cache teacher distributions offline (MobileCLIP2 recipe). Teachers must be Apache: Qwen2.5-VL-7B, Qwen3-VL-8B. NOT Apache: Qwen2.5-VL-72B, Qwen2.5-Omni-3B. Calibrate the teacher first, no label smoothing. The student cannot exceed teacher agreement; eval labels must not come from the teacher family.
+3. **Fine-tune** (`finetune_step`): log loss to train, Brier to select/evaluate (rule choice matters, 2608.28482). RPS for ordinal. Add counterfactual-question augmentation (same state, changed question, changed label). Coherence loss makes the objective non-proper: ablate with NLL/Brier.
+4. **RL** (`rl_step`): only when feedback is an outcome, not a label. `r = c - p_a` is an unbiased estimator of half the Brier gradient (tested in `tests/test_core.py`); RLVR with binary reward is overconfident. With labels, step 3 is strictly better (zero variance).
+5. **Calibrate**: `fit_temperature` on a disjoint labelled split, clamp [0.5, 5]. Weighted conformal under drift. LoRA fine-tunes are overconfident: always recalibrate.
