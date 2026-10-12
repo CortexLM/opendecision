@@ -41,6 +41,15 @@ class ModelConfig:
     rope_scaling: Literal["none", "linear", "yarn"] = "none"  # applied only when rope_factor > 1
     rope_factor: float = 1.0
     attn_gate: Literal["none", "headwise", "elementwise"] = "none"  # sigmoid gate on SDPA output (2505.06708 G1)
+    # ELECTRA RTD (improvement C, arXiv 2003.10555): >0 adds the generator `gen.*` and the discriminator head
+    # `rtd_disc.*`. Generator = same Encoder class, same head dim, heads = round(ratio*heads), tied tok embeddings.
+    rtd_gen_ratio: float = 0.0
+    rtd_gen_layers: int = 0      # 0 = same as layers
+
+def gen_dims(cfg: ModelConfig) -> tuple[int, int, int]:
+    """(d_gen, heads_gen, layers_gen): head dim kept (one RoPE table), heads = int(ratio*heads + 0.5) >= 1."""
+    hg = max(1, int(cfg.rtd_gen_ratio * cfg.heads + 0.5))
+    return hg * (cfg.d // cfg.heads), hg, cfg.rtd_gen_layers or cfg.layers
 
 
 def swiglu_ff(d: int) -> int:
@@ -130,7 +139,8 @@ class Block(nn.Module):
         y = self.n1(x)
         q, k, v = self.qkv(y).view(B, N, 3, self.h, d // self.h).permute(2, 0, 3, 1, 4)
         q, k = apply_rope(self.qn(q), cos, sin), apply_rope(self.kn(k), cos, sin)
-        a = F.scaled_dot_product_attention(q, k, v, attn_mask=None if mask is None else mask[:, None, None, :])
+        am = None if mask is None else mask[:, None] if mask.dim() == 3 else mask[:, None, None, :]  # [B,N,N]: doc mask
+        a = F.scaled_dot_product_attention(q, k, v, attn_mask=am)
         a = a.transpose(1, 2)
         if self.attn_gate != "none":
             a = a * torch.sigmoid(self.gate(y)).view(B, N, self.h, -1)
@@ -147,6 +157,19 @@ class Encoder(nn.Module):
         for b in self.blocks:
             x = b(x, mask, cos, sin)
         return self.norm(x)
+
+class Generator(nn.Module):
+    """ELECTRA generator over the shared (tied) token embedding: proj_in d->d_gen, Encoder, proj_out d_gen->d;
+    MLM logits = proj_out(h) @ tok.weight.T."""
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        dg, hg, lg = gen_dims(cfg)
+        self.proj_in = nn.Linear(cfg.d, dg, bias=False)
+        self.encoder = Encoder(dg, hg, lg, cfg.block, cfg.attn_gate)
+        self.proj_out = nn.Linear(dg, cfg.d, bias=False)
+
+    def forward(self, x, mask, cos, sin):
+        return self.proj_out(self.encoder(self.proj_in(x), mask, cos, sin))
 
 class Attention(nn.Module):
     """Head attention (SDPA): no bias, no QK-norm, no RoPE (options are order-equivariant)."""
@@ -239,6 +262,11 @@ def param_names(cfg: "ModelConfig") -> dict[str, tuple[int, ...]]:
     n.update({"scorer.0.weight": (d,), "scorer.0.bias": (d,), "scorer.1.weight": (d, d), "scorer.1.bias": (d,),
               "scorer.3.weight": (1, d), "scorer.3.bias": (1,)})
     n.update({f"log_temp.{k}": () for k in QTYPES})
+    if cfg.rtd_gen_ratio > 0:
+        dg, hg, lg = gen_dims(cfg)
+        n.update({"gen.proj_in.weight": (dg, d), "gen.proj_out.weight": (d, dg)})
+        n.update(_encoder_names("gen.encoder", dg, hg, lg, cfg.block, cfg.attn_gate))
+        n.update({"rtd_disc.weight": (1, d), "rtd_disc.bias": (1,)})
     if cfg.chunk:
         n["chunk_q"] = (cfg.chunk_latents, d)
         n.update({f"chunk_pool.{k}.weight": s for k, s in (("q", (d, d)), ("kv", (2 * d, d)), ("o", (d, d)))})
@@ -264,6 +292,9 @@ class OpenDecisionModel(nn.Module):
         self.head = nn.ModuleList([HeadLayer(c.d, c.heads) for _ in range(c.head_layers)])
         self.scorer = nn.Sequential(nn.LayerNorm(c.d), nn.Linear(c.d, c.d), nn.GELU(), nn.Linear(c.d, 1))
         self.log_temp = nn.ParameterDict({k: nn.Parameter(torch.zeros(())) for k in QTYPES})
+        if c.rtd_gen_ratio > 0:
+            self.gen = Generator(c)
+            self.rtd_disc = nn.Linear(c.d, 1)
         if c.chunk:
             self.chunk_q = nn.Parameter(torch.randn(c.chunk_latents, c.d) * 0.02)
             self.chunk_pool = Attention(c.d, c.heads)

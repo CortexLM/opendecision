@@ -7,24 +7,50 @@ from __future__ import annotations
 import torch
 
 from . import losses as L
-from .masking import rl_gumbel
+from .masking import doc_mask, rl_gumbel, rtd_gumbel
 from .tokenizer import MASK
 
 RULES = {"log": L.log_loss, "brier": L.brier, "spherical": L.spherical, "rps": L.rps}
 
-def mlm_loss(model, ids, positions, *, gather=None):
-    """Fixed-shape MLM loss on packed rows ids [B,N] (mask None), positions [B,n_mask] (sorted, from masking.py).
-    fp32 mean over B*n_mask. gather(h [B*N,d], rows [B*n_mask]) defaults to torch indexing (torch.gather semantics)."""
-    B, N = ids.shape
-    n = positions.size(1)
-    inp = ids.scatter(1, positions, torch.full_like(positions, MASK))
-    h = model.encode_tokens(inp)
-    rows = (torch.arange(B, device=ids.device)[:, None] * N + positions).reshape(-1)
+RTD_LAMBDA = 50.0   # ELECTRA discriminator weight (arXiv 2003.10555)
+
+def _attn_mask(ids, eos_id):
+    """None (v1, packed rows attend everywhere) or the [B,N,N] document-boundary mask from masking.doc_mask."""
+    return None if eos_id is None else torch.from_numpy(doc_mask(ids.cpu().numpy(), eos_id)).to(ids.device)
+
+def _masked_logits(h, positions, weight, gather):
+    B, N = h.shape[:2]
+    rows = (torch.arange(B, device=h.device)[:, None] * N + positions).reshape(-1)
     flat = h.reshape(B * N, -1)
     hm = flat[rows] if gather is None else gather(flat, rows)
-    logits = (hm @ model.tok.weight.T).float()
+    return (hm @ weight.T).float()
+
+def mlm_loss(model, ids, positions, *, gather=None, eos_id=None):
+    """Fixed-shape MLM loss on packed rows ids [B,N] (mask None), positions [B,n_mask] (sorted, from masking.py).
+    fp32 mean over B*n_mask. gather(h [B*N,d], rows [B*n_mask]) defaults to torch indexing (torch.gather semantics).
+    eos_id (improvement C, default None = v1): attention restricted to EOS-delimited documents (doc_mask)."""
+    inp = ids.scatter(1, positions, torch.full_like(positions, MASK))
+    h = model.encode_tokens(inp, _attn_mask(ids, eos_id))
+    logits = _masked_logits(h, positions, model.tok.weight, gather)
     tgt = ids.gather(1, positions).reshape(-1)
     return torch.nn.functional.cross_entropy(logits, tgt)
+
+def rtd_loss(model, ids, positions, *, seed: int, eos_id=None, lam=RTD_LAMBDA, gather=None):
+    """ELECTRA (arXiv 2003.10555) on packed rows: generator MLM CE at `positions` + lam * discriminator BCE over
+    all B*N tokens (label = token differs from the original). Generator samples = argmax(logits + Gumbel) with
+    Philox noise from masking.rtd_gumbel(ids, seed) (replay-safe; no torch sampler). Needs rtd_gen_ratio > 0."""
+    N = ids.size(1)
+    am = _attn_mask(ids, eos_id)
+    inp = ids.scatter(1, positions, torch.full_like(positions, MASK))
+    hg = model.gen(model._embed(inp), am, *model._rope(N))
+    glog = _masked_logits(hg, positions, model.tok.weight, gather)
+    gen = torch.nn.functional.cross_entropy(glog, ids.gather(1, positions).reshape(-1))
+    g = torch.from_numpy(rtd_gumbel(ids.cpu().numpy(), seed, positions.size(1), glog.size(-1))).to(ids.device)
+    sample = (glog.detach().double().reshape(g.shape) + g).argmax(-1)
+    corrupt = ids.scatter(1, positions, sample)
+    logit = model.rtd_disc(model.encode_tokens(corrupt, am)).squeeze(-1).float()
+    disc = torch.nn.functional.binary_cross_entropy_with_logits(logit, (corrupt != ids).float())
+    return gen + lam * disc
 
 def decision_loss(logits, opt_mask_ext, y, qtype, rule="log", rps_w=1.0):
     """Per-question losses, weighted (not compacted) so shapes stay constant. RPS on qtype==1, `rule` elsewhere.
@@ -59,10 +85,15 @@ def finetune_step(model, opt, b, rule="log", rps_w=1.0, coh=None, coh_w=0.1):
         loss = loss + coh_w * coh(model, b)
     return _step(model, opt, loss)
 
-def mlm_step(model, opt, ids, positions):
-    """Stage 0: masked-token pretraining; positions from opendecision.masking.mask_positions."""
+def mlm_step(model, opt, ids, positions, *, eos_id=None):
+    """Stage 0: masked-token pretraining; positions from masking.mask_positions (or span_positions)."""
     model.train()
-    return _step(model, opt, mlm_loss(model, ids, positions))
+    return _step(model, opt, mlm_loss(model, ids, positions, eos_id=eos_id))
+
+def rtd_step(model, opt, ids, positions, *, seed: int, eos_id=None):
+    """Stage 0 alternative (objective "rtd"): ELECTRA generator + discriminator, see rtd_loss."""
+    model.train()
+    return _step(model, opt, rtd_loss(model, ids, positions, seed=seed, eos_id=eos_id))
 
 def distill_step(model, opt, b, teacher_probs, T=1.0):
     """Stage 1: KD from cached (offline) teacher distributions [B,Q,K+1]."""
