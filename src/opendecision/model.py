@@ -46,6 +46,15 @@ class ModelConfig:
     rtd_gen_ratio: float = 0.0
     rtd_gen_layers: int = 0      # 0 = same as layers
     freeze_log_temp: bool = False  # improvement D, stage C: log_temp.* detached in decide (no grads; set by calibrate)
+    # gated MoE observation path (improvement G, model-size-moe.md 2.1): n_experts > 1 replaces the FFN of
+    # encoder blocks range(moe_first, layers, moe_every) by a fp32-routed top-k mixture of full-size FFNs.
+    n_experts: int = 1
+    top_k: int = 1
+    moe_every: int = 2
+    moe_first: int = 2
+    router_z_coef: float = 1e-3   # ST-MoE z-loss (2202.08906)
+    aux_coef: float = 0.01        # Switch load-balance loss (2101.03961)
+    capacity_factor: float = 1.25
 
 def gen_dims(cfg: ModelConfig) -> tuple[int, int, int]:
     """(d_gen, heads_gen, layers_gen): head dim kept (one RoPE table), heads = int(ratio*heads + 0.5) >= 1."""
@@ -57,6 +66,24 @@ def swiglu_ff(d: int) -> int:
     """(8/3)*d rounded (half up) to a multiple of 64: SwiGLU 3*d*f ~ param-matched to the 4d GELU MLP."""
     return (d + 12) // 24 * 64
 
+
+def moe_layers(cfg: ModelConfig) -> range:
+    """Encoder block indices whose FFN is a MoE (empty when n_experts == 1)."""
+    return range(cfg.moe_first, cfg.layers, cfg.moe_every) if cfg.n_experts > 1 else range(0)
+
+def route(logits: torch.Tensor, k: int, capacity: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Copy of hypertrain.trainer.model.route: (experts [k*T] rank-major, keep [k*T]) for logits [T,E].
+    Stable descending sort (ties -> lowest expert index); capacity drops in (rank, token) order."""
+    order = torch.sort(logits, dim=-1, descending=True, stable=True).indices[:, :k]
+    experts = order.t().reshape(-1)
+    seg = torch.sort(experts, stable=True).indices
+    sorted_e = experts.index_select(0, seg)
+    counts = torch.bincount(sorted_e, minlength=logits.shape[1])
+    starts = torch.cumsum(counts, 0) - counts
+    pos_sorted = torch.arange(sorted_e.numel(), device=sorted_e.device) - starts.index_select(0, sorted_e)
+    keep = torch.empty_like(experts, dtype=torch.bool)
+    keep[seg] = pos_sorted < capacity
+    return experts, keep
 
 def rope_table(n: int, head_dim: int, theta: float, scaling: str = "none", factor: float = 1.0,
                orig_len: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
@@ -116,8 +143,11 @@ def sincos(idx, d):
     return torch.cat([a.sin(), a.cos()], -1)[:, :d]
 
 
+def _ffn(d, block):
+    return nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d)) if block == "v1" else SwiGLU(d, swiglu_ff(d))
+
 class Block(nn.Module):
-    def __init__(self, d, heads, block="v1", attn_gate="none"):
+    def __init__(self, d, heads, block="v1", attn_gate="none", moe: ModelConfig | None = None):
         super().__init__()
         self.h = heads
         hd = d // heads
@@ -126,11 +156,16 @@ class Block(nn.Module):
         if block == "v1":
             self.qn, self.kn = nn.LayerNorm(hd), nn.LayerNorm(hd)   # QK-norm: stability at scale
             self.n1, self.n2 = nn.LayerNorm(d), nn.LayerNorm(d)
-            self.ff = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
         else:
             self.qn, self.kn = RMSNorm(hd), RMSNorm(hd)
             self.n1, self.n2 = RMSNorm(d), RMSNorm(d)
-            self.ff = SwiGLU(d, swiglu_ff(d))
+        self.moe = moe
+        if moe is None:
+            self.ff = _ffn(d, block)
+        else:  # G: no shared expert; each expert is the full FFN of the block version
+            self.router = nn.Linear(d, moe.n_experts, bias=False)
+            self.experts = nn.ModuleList([_ffn(d, block) for _ in range(moe.n_experts)])
+            self.aux: tuple[torch.Tensor, torch.Tensor] | None = None  # (Switch LBL, z-loss) of the last call
         self.attn_gate = attn_gate
         if attn_gate != "none":   # G1: gate computed from the (normed) block input, per head or per element
             self.gate = nn.Linear(d, heads if attn_gate == "headwise" else d, bias=False)
@@ -146,12 +181,35 @@ class Block(nn.Module):
         if self.attn_gate != "none":
             a = a * torch.sigmoid(self.gate(y)).view(B, N, self.h, -1)
         x = x + self.o(a.reshape(B, N, d))
-        return x + self.ff(self.n2(x))
+        return x + (self.ff(self.n2(x)) if self.moe is None else self._moe(self.n2(x)))
+
+    def _moe(self, x):
+        """Same math as hypertrain trainer/model.py _moe: fp32 router, route(), softmax over the k chosen
+        logits, dispatch/combine as permutations (index_select), aux = (E * sum(frac * mean prob), mean lse^2)."""
+        c = self.moe
+        B, N, d = x.shape
+        n, k, e = B * N, c.top_k, c.n_experts
+        flat = x.reshape(n, d)
+        with torch.autocast(x.device.type, enabled=False):
+            logits = flat.float() @ self.router.weight.float().T
+        experts, keep = route(logits.detach(), k, math.ceil(c.capacity_factor * n * k / e))
+        onehot = F.one_hot(experts.view(k, n).t(), e).to(logits.dtype)
+        sel = (onehot * logits[:, None, :]).sum(-1).softmax(-1).t().reshape(-1)
+        w = (sel * keep.to(sel.dtype)).to(x.dtype)
+        seg = torch.sort(experts, stable=True).indices
+        rows = flat.repeat(k, 1).index_select(0, seg)
+        counts = torch.bincount(experts, minlength=e).tolist()
+        outs = [f(r) for f, r in zip(self.experts, torch.split(rows, counts))]
+        y = torch.cat(outs, 0).index_select(0, torch.argsort(seg, stable=True)) * w[:, None]
+        frac = torch.bincount(experts[keep], minlength=e).float() / max(1, n * k)
+        self.aux = (e * (frac * logits.softmax(-1).mean(0)).sum(), torch.logsumexp(logits, -1).pow(2).mean())
+        return y.view(k, n, d).sum(0).view(B, N, d)
 
 class Encoder(nn.Module):
-    def __init__(self, d, heads, layers, block="v1", attn_gate="none"):
+    def __init__(self, d, heads, layers, block="v1", attn_gate="none", moe: ModelConfig | None = None):
         super().__init__()
-        self.blocks = nn.ModuleList([Block(d, heads, block, attn_gate) for _ in range(layers)])
+        ml = set(moe_layers(moe)) if moe is not None else set()
+        self.blocks = nn.ModuleList([Block(d, heads, block, attn_gate, moe if i in ml else None) for i in range(layers)])
         self.norm = nn.LayerNorm(d) if block == "v1" else RMSNorm(d)
 
     def forward(self, x, mask, cos, sin):
@@ -217,9 +275,16 @@ class TokEmbed(nn.Module):
     def forward(self, ids):
         return self.embed_fn(self.weight, ids)
 
-def _encoder_names(prefix, d, heads, layers, block="v1", attn_gate="none"):
+def _ffn_names(p, d, block):
+    if block == "v1":
+        return {f"{p}.0.weight": (4 * d, d), f"{p}.0.bias": (4 * d,), f"{p}.2.weight": (d, 4 * d), f"{p}.2.bias": (d,)}
+    f = swiglu_ff(d)
+    return {f"{p}.gate.weight": (f, d), f"{p}.up.weight": (f, d), f"{p}.down.weight": (d, f)}
+
+def _encoder_names(prefix, d, heads, layers, block="v1", attn_gate="none", moe: ModelConfig | None = None):
     n = {}
     v1 = block == "v1"
+    ml = set(moe_layers(moe)) if moe is not None else set()
     for i in range(layers):
         p = f"{prefix}.blocks.{i}"
         n.update({f"{p}.qkv.weight": (3 * d, d), f"{p}.o.weight": (d, d)})
@@ -231,12 +296,12 @@ def _encoder_names(prefix, d, heads, layers, block="v1", attn_gate="none"):
             n[f"{p}.{k}.weight"] = (d,)
             if v1:
                 n[f"{p}.{k}.bias"] = (d,)
-        if v1:
-            n.update({f"{p}.ff.0.weight": (4 * d, d), f"{p}.ff.0.bias": (4 * d,),
-                      f"{p}.ff.2.weight": (d, 4 * d), f"{p}.ff.2.bias": (d,)})
+        if i in ml:
+            n[f"{p}.router.weight"] = (moe.n_experts, d)
+            for e in range(moe.n_experts):
+                n.update(_ffn_names(f"{p}.experts.{e}", d, block))
         else:
-            f = swiglu_ff(d)
-            n.update({f"{p}.ff.gate.weight": (f, d), f"{p}.ff.up.weight": (f, d), f"{p}.ff.down.weight": (d, f)})
+            n.update(_ffn_names(f"{p}.ff", d, block))
         if attn_gate != "none":
             n[f"{p}.gate.weight"] = (heads if attn_gate == "headwise" else d, d)
     n[f"{prefix}.norm.weight"] = (d,)
@@ -247,7 +312,7 @@ def _encoder_names(prefix, d, heads, layers, block="v1", attn_gate="none"):
 def param_names(cfg: "ModelConfig") -> dict[str, tuple[int, ...]]:
     """Pinned state-dict names and shapes (single source for counts, checkpoints, adapter)."""
     d = cfg.d
-    n = _encoder_names("encoder", d, cfg.heads, cfg.layers, cfg.block, cfg.attn_gate)
+    n = _encoder_names("encoder", d, cfg.heads, cfg.layers, cfg.block, cfg.attn_gate, cfg)
     n["tok.weight"] = (cfg.vocab, d)
     if cfg.emb_norm:
         n.update({"emb_norm.weight": (d,), "emb_norm.bias": (d,)})
@@ -284,7 +349,7 @@ class OpenDecisionModel(nn.Module):
         self.tok = TokEmbed(c.vocab, c.d, embed_fn)
         if c.emb_norm:
             self.emb_norm = nn.LayerNorm(c.d)
-        self.encoder = Encoder(c.d, c.heads, c.layers, c.block, c.attn_gate)
+        self.encoder = Encoder(c.d, c.heads, c.layers, c.block, c.attn_gate, c)
         cos, sin = self._table(c.max_len, c.rope_theta)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
@@ -305,7 +370,9 @@ class OpenDecisionModel(nn.Module):
             self.register_buffer("rope_gsin", gsin, persistent=False)
         if c.init_scheme == "trunc002":
             for n, p in self.named_parameters():
-                if p.dim() >= 2 or n == "unknown":
+                if n.endswith(".router.weight"):  # G: router std 0.1x
+                    nn.init.trunc_normal_(p, std=0.002, a=-0.006, b=0.006)
+                elif p.dim() >= 2 or n == "unknown":
                     nn.init.trunc_normal_(p, std=0.02, a=-0.06, b=0.06)
                 elif n.endswith(".bias"):
                     nn.init.zeros_(p)
