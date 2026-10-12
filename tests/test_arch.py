@@ -119,3 +119,29 @@ def test_rope_table_and_embed_fn():
     m = OpenDecisionModel(TINY, embed_fn=lambda w, i: (calls.append(1), F.embedding(i, w))[1])
     m.encode_tokens(torch.randint(3, 20, (1, 4)))
     assert calls and "tok.weight" in m.state_dict()
+
+
+def _v1_model(cfg):
+    torch.manual_seed(0)
+    return OpenDecisionModel(cfg)
+
+
+def test_init_a_default_is_v1_and_trunc002_bounded():
+    import dataclasses
+    a, b = _v1_model(TINY), _v1_model(dataclasses.replace(TINY, init_scheme="v1", emb_norm=False))
+    assert all(torch.equal(x, y) for x, y in zip(a.state_dict().values(), b.state_dict().values()))
+    assert "emb_norm.weight" not in M.param_names(TINY)
+    w = _v1_model(dataclasses.replace(TINY, init_scheme="trunc002")).tok.weight
+    assert abs(w.std().item() - 0.02) < 0.002 and w.abs().max().item() <= 0.06
+    assert abs(a.tok.weight.std().item() - 1.0) < 0.05   # v1 embedding stays std 1
+
+
+def test_emb_norm_params_and_forward():
+    import dataclasses
+    cfg = dataclasses.replace(TINY, emb_norm=True)
+    m = _v1_model(cfg)
+    assert {k: tuple(v.shape) for k, v in m.state_dict().items()} == M.param_names(cfg)
+    ids = torch.randint(3, cfg.vocab, (2, 8))
+    x = m.encode_tokens(ids)
+    ref = m.encoder(F.layer_norm(m.tok(ids), (cfg.d,)), None, *m._rope(8))
+    assert torch.allclose(x, ref)

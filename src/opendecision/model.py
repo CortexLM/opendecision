@@ -11,7 +11,7 @@ share one encoder and one embedding table."""
 from __future__ import annotations
 import math
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,6 +33,8 @@ class ModelConfig:
     chunk_latents: int = 16      # latents kept per chunk (index for the global layers)
     global_layers: int = 2       # layers over the chunk latents
     global_theta: float = 160_000.0  # ModernBERT raises theta on global layers for long context
+    init_scheme: Literal["v1", "trunc002"] = "v1"  # trunc002: weights trunc-normal std 0.02 (+-3 sigma), biases 0 (arch-review A/W1)
+    emb_norm: bool = False       # LayerNorm after the token embedding (arch-review A/W2)
     keep_tokens: bool = False    # heads also see full token states (+chunk id). UNPROVEN: in the toy needle test it stayed at chance (0.5) where latents-only reached 1.0 in 500 steps
 
 
@@ -150,6 +152,8 @@ def param_names(cfg: "ModelConfig") -> dict[str, tuple[int, ...]]:
     d = cfg.d
     n = _encoder_names("encoder", d, cfg.heads, cfg.layers)
     n["tok.weight"] = (cfg.vocab, d)
+    if cfg.emb_norm:
+        n.update({"emb_norm.weight": (d,), "emb_norm.bias": (d,)})
     n.update({"type_emb.weight": (3, d), "unknown": (d,)})
     for j in range(cfg.head_layers):
         p = f"head.{j}"
@@ -176,6 +180,8 @@ class OpenDecisionModel(nn.Module):
         super().__init__()
         c = self.cfg = cfg or ModelConfig()
         self.tok = TokEmbed(c.vocab, c.d, embed_fn)
+        if c.emb_norm:
+            self.emb_norm = nn.LayerNorm(c.d)
         self.encoder = Encoder(c.d, c.heads, c.layers)
         hd = c.d // c.heads
         cos, sin = rope_table(c.max_len, hd, c.rope_theta)
@@ -193,6 +199,16 @@ class OpenDecisionModel(nn.Module):
             gcos, gsin = rope_table(c.max_len, hd, c.global_theta)
             self.register_buffer("rope_gcos", gcos, persistent=False)
             self.register_buffer("rope_gsin", gsin, persistent=False)
+        if c.init_scheme == "trunc002":
+            for n, p in self.named_parameters():
+                if p.dim() >= 2 or n == "unknown":
+                    nn.init.trunc_normal_(p, std=0.02, a=-0.06, b=0.06)
+                elif n.endswith(".bias"):
+                    nn.init.zeros_(p)
+
+    def _embed(self, ids):
+        x = self.tok(ids)
+        return self.emb_norm(x) if self.cfg.emb_norm else x
 
     def _rope(self, n, glob=False):
         """Slice of the precomputed table; beyond max_len the table is rebuilt (RoPE has no hard cap)."""
@@ -209,7 +225,7 @@ class OpenDecisionModel(nn.Module):
         pad = (-N) % c.chunk
         ids, mask = F.pad(ids, (0, pad)), F.pad(mask, (0, pad))
         nc = ids.size(1) // c.chunk
-        x = self.tok(ids).reshape(B * nc, c.chunk, -1)
+        x = self._embed(ids).reshape(B * nc, c.chunk, -1)
         m = mask.reshape(B * nc, c.chunk)
         m = m | (~m.any(1, keepdim=True) & (torch.arange(c.chunk, device=ids.device) == 0))  # empty chunk stays finite
         h = self.encoder(x, m, *self._rope(c.chunk))
@@ -222,7 +238,7 @@ class OpenDecisionModel(nn.Module):
                 mask = torch.ones_like(ids, dtype=torch.bool)
             h, _, _, B, nc = self._chunks(ids, mask)
             return h.reshape(B, nc * self.cfg.chunk, -1)[:, : ids.size(1)]
-        return self.encoder(self.tok(ids), mask, *self._rope(ids.size(1)))
+        return self.encoder(self._embed(ids), mask, *self._rope(ids.size(1)))
 
     def encode_state(self, ids, mask=None):
         c = self.cfg
@@ -249,7 +265,7 @@ class OpenDecisionModel(nn.Module):
         flat = ids.reshape(-1, T)
         m = flat != PAD
         m[:, 0] = True
-        h = self.encoder(self.tok(flat), m, *self._rope(T))
+        h = self.encoder(self._embed(flat), m, *self._rope(T))
         w = m.unsqueeze(-1).to(h.dtype)
         return ((h * w).sum(1) / w.sum(1)).view(*sh, -1)
 

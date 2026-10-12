@@ -7,4 +7,4 @@ PRESETS: dict[str, ModelConfig] = {
     "od-base": ModelConfig(d=768, layers=12, heads=12, head_layers=2, max_len=1024, vocab=MODEL_VOCAB, chunk=0),
     "od-large": ModelConfig(d=1024, layers=24, heads=16, head_layers=4, max_len=1024, vocab=MODEL_VOCAB, chunk=0),
 }
-STAGE_A_PREFIXES = ("tok.", "encoder.")
+STAGE_A_PREFIXES = ("tok.", "emb_norm.", "encoder.")
