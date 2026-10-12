@@ -30,6 +30,13 @@ def test_param_names_match_state_dict_and_a3_counts():
         assert M.od_param_count(cfg) == full and len(names) == n
         assert sum(math.prod(s) for k, s in names.items() if k.startswith(("tok.", "encoder."))) == stage_a
 
+def test_v2_presets_are_best_measured_flags_and_v1_untouched():
+    for k in ("od-tiny", "od-base", "od-large"):
+        v1, v2 = PRESETS[k], PRESETS[f"{k}-v2"]
+        assert (v1.init_scheme, v1.emb_norm, v1.block) == ("v1", False, "v1")
+        assert (v2.init_scheme, v2.emb_norm, v2.block) == ("trunc002", True, "v2")
+        assert (v2.d, v2.layers, v2.heads, v2.vocab) == (v1.d, v1.layers, v1.heads, v1.vocab)
+
 def test_no_multihead_attention_and_head_attention_plain():
     m = OpenDecisionModel(TINY)
     assert not any(isinstance(x, nn.MultiheadAttention) for x in m.modules())
