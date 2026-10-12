@@ -36,14 +36,62 @@ class ModelConfig:
     init_scheme: Literal["v1", "trunc002"] = "v1"  # trunc002: weights trunc-normal std 0.02 (+-3 sigma), biases 0 (arch-review A/W1)
     emb_norm: bool = False       # LayerNorm after the token embedding (arch-review A/W2)
     keep_tokens: bool = False    # heads also see full token states (+chunk id). UNPROVEN: in the toy needle test it stayed at chance (0.5) where latents-only reached 1.0 in 500 steps
+    # block v2 (arch-review B): pre-norm RMSNorm, bias-free linears, RMS QK-norm, SwiGLU d_ff=swiglu_ff(d)
+    block: Literal["v1", "v2"] = "v1"
+    rope_scaling: Literal["none", "linear", "yarn"] = "none"  # applied only when rope_factor > 1
+    rope_factor: float = 1.0
+    attn_gate: Literal["none", "headwise", "elementwise"] = "none"  # sigmoid gate on SDPA output (2505.06708 G1)
 
 
-def rope_table(n: int, head_dim: int, theta: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """cos/sin [n, head_dim//2], built on CPU in float64 (host-independent) and cast to fp32."""
+def swiglu_ff(d: int) -> int:
+    """(8/3)*d rounded (half up) to a multiple of 64: SwiGLU 3*d*f ~ param-matched to the 4d GELU MLP."""
+    return (d + 12) // 24 * 64
+
+
+def rope_table(n: int, head_dim: int, theta: float, scaling: str = "none", factor: float = 1.0,
+               orig_len: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    """cos/sin [n, head_dim//2], built on CPU in float64 (host-independent) and cast to fp32.
+    scaling (only when factor > 1): "linear" = position interpolation (all freqs / factor); "yarn" =
+    arXiv 2309.00071 NTK-by-parts ramp over r = orig_len/wavelength (alpha=1, beta=32) plus the
+    attention temperature sqrt(1/t) = 0.1 ln(factor) + 1 folded into cos/sin (so it scales q and k)."""
     half = head_dim // 2
     inv = theta ** (-torch.arange(half, device="cpu", dtype=torch.float64) / half)
+    mscale = 1.0
+    if scaling == "linear" and factor > 1:
+        inv = inv / factor
+    elif scaling == "yarn" and factor > 1:
+        g = ((orig_len * inv / (2 * math.pi) - 1.0) / (32.0 - 1.0)).clamp(0.0, 1.0)
+        inv = (1 - g) * inv / factor + g * inv
+        mscale = 0.1 * math.log(factor) + 1.0
     ang = torch.arange(n, device="cpu", dtype=torch.float64)[:, None] * inv
+    if mscale != 1.0:
+        return (ang.cos() * mscale).to(torch.float32), (ang.sin() * mscale).to(torch.float32)
     return ang.cos().to(torch.float32), ang.sin().to(torch.float32)
+
+
+def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Bias-free RMSNorm computed in fp32 with explicit ops (deterministic), cast back to x.dtype."""
+    y = x.float()
+    return (y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + eps) * w.float()).to(x.dtype)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, n):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(n))
+
+    def forward(self, x):
+        return rms_norm(x, self.weight)
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, d, f):
+        super().__init__()
+        self.gate, self.up = nn.Linear(d, f, bias=False), nn.Linear(d, f, bias=False)
+        self.down = nn.Linear(f, d, bias=False)
+
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """x [B,H,N,hd]; cos/sin [N,hd/2] (rotate-half)."""
@@ -59,29 +107,41 @@ def sincos(idx, d):
 
 
 class Block(nn.Module):
-    def __init__(self, d, heads):
+    def __init__(self, d, heads, block="v1", attn_gate="none"):
         super().__init__()
         self.h = heads
         hd = d // heads
         self.qkv = nn.Linear(d, 3 * d, bias=False)
         self.o = nn.Linear(d, d, bias=False)
-        self.qn, self.kn = nn.LayerNorm(hd), nn.LayerNorm(hd)   # QK-norm: stability at scale
-        self.n1, self.n2 = nn.LayerNorm(d), nn.LayerNorm(d)
-        self.ff = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
+        if block == "v1":
+            self.qn, self.kn = nn.LayerNorm(hd), nn.LayerNorm(hd)   # QK-norm: stability at scale
+            self.n1, self.n2 = nn.LayerNorm(d), nn.LayerNorm(d)
+            self.ff = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
+        else:
+            self.qn, self.kn = RMSNorm(hd), RMSNorm(hd)
+            self.n1, self.n2 = RMSNorm(d), RMSNorm(d)
+            self.ff = SwiGLU(d, swiglu_ff(d))
+        self.attn_gate = attn_gate
+        if attn_gate != "none":   # G1: gate computed from the (normed) block input, per head or per element
+            self.gate = nn.Linear(d, heads if attn_gate == "headwise" else d, bias=False)
 
     def forward(self, x, mask, cos, sin):
         B, N, d = x.shape
-        q, k, v = self.qkv(self.n1(x)).view(B, N, 3, self.h, d // self.h).permute(2, 0, 3, 1, 4)
+        y = self.n1(x)
+        q, k, v = self.qkv(y).view(B, N, 3, self.h, d // self.h).permute(2, 0, 3, 1, 4)
         q, k = apply_rope(self.qn(q), cos, sin), apply_rope(self.kn(k), cos, sin)
         a = F.scaled_dot_product_attention(q, k, v, attn_mask=None if mask is None else mask[:, None, None, :])
-        x = x + self.o(a.transpose(1, 2).reshape(B, N, d))
+        a = a.transpose(1, 2)
+        if self.attn_gate != "none":
+            a = a * torch.sigmoid(self.gate(y)).view(B, N, self.h, -1)
+        x = x + self.o(a.reshape(B, N, d))
         return x + self.ff(self.n2(x))
 
 class Encoder(nn.Module):
-    def __init__(self, d, heads, layers):
+    def __init__(self, d, heads, layers, block="v1", attn_gate="none"):
         super().__init__()
-        self.blocks = nn.ModuleList([Block(d, heads) for _ in range(layers)])
-        self.norm = nn.LayerNorm(d)
+        self.blocks = nn.ModuleList([Block(d, heads, block, attn_gate) for _ in range(layers)])
+        self.norm = nn.LayerNorm(d) if block == "v1" else RMSNorm(d)
 
     def forward(self, x, mask, cos, sin):
         for b in self.blocks:
@@ -133,24 +193,37 @@ class TokEmbed(nn.Module):
     def forward(self, ids):
         return self.embed_fn(self.weight, ids)
 
-def _encoder_names(prefix, d, heads, layers):
+def _encoder_names(prefix, d, heads, layers, block="v1", attn_gate="none"):
     n = {}
+    v1 = block == "v1"
     for i in range(layers):
         p = f"{prefix}.blocks.{i}"
         n.update({f"{p}.qkv.weight": (3 * d, d), f"{p}.o.weight": (d, d)})
         for k in ("qn", "kn"):
-            n.update({f"{p}.{k}.weight": (d // heads,), f"{p}.{k}.bias": (d // heads,)})
+            n[f"{p}.{k}.weight"] = (d // heads,)
+            if v1:
+                n[f"{p}.{k}.bias"] = (d // heads,)
         for k in ("n1", "n2"):
-            n.update({f"{p}.{k}.weight": (d,), f"{p}.{k}.bias": (d,)})
-        n.update({f"{p}.ff.0.weight": (4 * d, d), f"{p}.ff.0.bias": (4 * d,),
-                  f"{p}.ff.2.weight": (d, 4 * d), f"{p}.ff.2.bias": (d,)})
-    n.update({f"{prefix}.norm.weight": (d,), f"{prefix}.norm.bias": (d,)})
+            n[f"{p}.{k}.weight"] = (d,)
+            if v1:
+                n[f"{p}.{k}.bias"] = (d,)
+        if v1:
+            n.update({f"{p}.ff.0.weight": (4 * d, d), f"{p}.ff.0.bias": (4 * d,),
+                      f"{p}.ff.2.weight": (d, 4 * d), f"{p}.ff.2.bias": (d,)})
+        else:
+            f = swiglu_ff(d)
+            n.update({f"{p}.ff.gate.weight": (f, d), f"{p}.ff.up.weight": (f, d), f"{p}.ff.down.weight": (d, f)})
+        if attn_gate != "none":
+            n[f"{p}.gate.weight"] = (heads if attn_gate == "headwise" else d, d)
+    n[f"{prefix}.norm.weight"] = (d,)
+    if v1:
+        n[f"{prefix}.norm.bias"] = (d,)
     return n
 
 def param_names(cfg: "ModelConfig") -> dict[str, tuple[int, ...]]:
     """Pinned state-dict names and shapes (single source for counts, checkpoints, adapter)."""
     d = cfg.d
-    n = _encoder_names("encoder", d, cfg.heads, cfg.layers)
+    n = _encoder_names("encoder", d, cfg.heads, cfg.layers, cfg.block, cfg.attn_gate)
     n["tok.weight"] = (cfg.vocab, d)
     if cfg.emb_norm:
         n.update({"emb_norm.weight": (d,), "emb_norm.bias": (d,)})
@@ -169,7 +242,7 @@ def param_names(cfg: "ModelConfig") -> dict[str, tuple[int, ...]]:
     if cfg.chunk:
         n["chunk_q"] = (cfg.chunk_latents, d)
         n.update({f"chunk_pool.{k}.weight": s for k, s in (("q", (d, d)), ("kv", (2 * d, d)), ("o", (d, d)))})
-        n.update(_encoder_names("global_enc", d, cfg.heads, cfg.global_layers))
+        n.update(_encoder_names("global_enc", d, cfg.heads, cfg.global_layers, cfg.block, cfg.attn_gate))
     return n
 
 def od_param_count(cfg: "ModelConfig") -> int:
@@ -182,9 +255,8 @@ class OpenDecisionModel(nn.Module):
         self.tok = TokEmbed(c.vocab, c.d, embed_fn)
         if c.emb_norm:
             self.emb_norm = nn.LayerNorm(c.d)
-        self.encoder = Encoder(c.d, c.heads, c.layers)
-        hd = c.d // c.heads
-        cos, sin = rope_table(c.max_len, hd, c.rope_theta)
+        self.encoder = Encoder(c.d, c.heads, c.layers, c.block, c.attn_gate)
+        cos, sin = self._table(c.max_len, c.rope_theta)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
         self.type_emb = nn.Embedding(3, c.d)
@@ -195,8 +267,8 @@ class OpenDecisionModel(nn.Module):
         if c.chunk:
             self.chunk_q = nn.Parameter(torch.randn(c.chunk_latents, c.d) * 0.02)
             self.chunk_pool = Attention(c.d, c.heads)
-            self.global_enc = Encoder(c.d, c.heads, c.global_layers)
-            gcos, gsin = rope_table(c.max_len, hd, c.global_theta)
+            self.global_enc = Encoder(c.d, c.heads, c.global_layers, c.block, c.attn_gate)
+            gcos, gsin = self._table(c.max_len, c.global_theta)
             self.register_buffer("rope_gcos", gcos, persistent=False)
             self.register_buffer("rope_gsin", gsin, persistent=False)
         if c.init_scheme == "trunc002":
@@ -210,13 +282,17 @@ class OpenDecisionModel(nn.Module):
         x = self.tok(ids)
         return self.emb_norm(x) if self.cfg.emb_norm else x
 
+    def _table(self, n, theta):
+        c = self.cfg
+        return rope_table(n, c.d // c.heads, theta, c.rope_scaling, c.rope_factor, c.max_len)
+
     def _rope(self, n, glob=False):
         """Slice of the precomputed table; beyond max_len the table is rebuilt (RoPE has no hard cap)."""
         c = self.cfg
         cos, sin = (self.rope_gcos, self.rope_gsin) if glob else (self.rope_cos, self.rope_sin)
         if n <= cos.size(0):
             return cos[:n], sin[:n]
-        return rope_table(n, c.d // c.heads, c.global_theta if glob else c.rope_theta)
+        return self._table(n, c.global_theta if glob else c.rope_theta)
 
     # ---- stage 1: encode state once ----------------------------------------------------
     def _chunks(self, ids, mask):
