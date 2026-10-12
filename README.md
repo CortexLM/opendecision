@@ -22,7 +22,27 @@
 </p>
 
 
-Full design, FLOPs budget and per-modality SLAs: [docs/architecture.md](docs/architecture.md).
+Use the `-v2` presets. They add truncated-normal init with an embedding LayerNorm, and the v2 block (pre-norm RMSNorm, bias-free linears, SwiGLU, QK-norm).
+
+| preset | params | notes |
+|---|---|---|
+| `od-tiny-v2` | 0.2M | CPU tests |
+| `od-base-v2` | ~143M | default |
+| `od-large-v2` | ~422M | |
+
+On a 6-layer proxy (3 seeds), v2 vs v1: MLM eval loss 5.74 -> 3.87, Banking77 probe accuracy 0.40 -> 0.86. The v1 presets (`od-base`, ...) are unchanged and still replay bit-for-bit.
+
+```python
+from opendecision import OpenDecisionModel
+from opendecision.presets import PRESETS
+model = OpenDecisionModel(PRESETS["od-base-v2"])
+```
+
+Optional, off by default, behind `ModelConfig` flags:
+- Gated attention: `attn_gate`.
+- Document-boundary masking, span masking, ELECTRA RTD: `train.mlm_loss(eos_id=)`, `masking.span_positions`, `train.rtd_loss`.
+- Top-2 MoE: `n_experts`, `top_k`.
+- Long context: `local_window`, `rope_scaling`.
 
 ## Quickstart
 
@@ -76,7 +96,7 @@ Pinned baseline version, same items and criteria, zero-shot and fine-tuned repor
 
 ## Docs
 
-[architecture](docs/architecture.md) · [training](docs/training.md) · [evaluation](docs/evaluation.md) · [serving](docs/serving.md) · [economics](docs/economics.md) · [long context](docs/long-context.md) · [world knowledge](docs/world-knowledge.md) · [datasets & licences](docs/datasets.md) · [research evidence](RESEARCH.md)
+[training](docs/training.md) · [evaluation](docs/evaluation.md) · [serving](docs/serving.md) · [economics](docs/economics.md) · [long context](docs/long-context.md) · [world knowledge](docs/world-knowledge.md) · [datasets & licences](docs/datasets.md) · [research evidence](RESEARCH.md)
 
 ## Credits
 

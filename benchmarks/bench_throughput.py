@@ -19,7 +19,7 @@ with torch.no_grad(), torch.autocast(a.device, dtype=dt, enabled=a.device == "cu
     for _ in range(a.iters): m.encode_state(ids, mask)
     if a.device == "cuda": torch.cuda.synchronize()
     tps = a.iters * a.batch * a.seq / (time.perf_counter() - t)
-d = Decider(m, a.device); lat = []
+d = Decider(m, device=a.device); lat = []
 req = {"state": "x" * 400, "questions": {"q": {"type": "choice", "instructions": "?", "criteria": {"a": "a", "b": "b"}}}}
 for _ in range(50):
     t = time.perf_counter(); d.predict(req); lat.append((time.perf_counter() - t) * 1e3)
