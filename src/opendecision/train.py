@@ -3,8 +3,11 @@ runs on CPU for tests and under torchrun/DDP for real runs.
 
 Batch dict: ids, mask, opt_ids, opt_mask, instr_ids, qtype, y [B,Q] (y == K means the unknown slot)."""
 from __future__ import annotations
+
 import torch
+
 from . import losses as L
+from .masking import rl_gumbel
 from .tokenizer import MASK
 
 RULES = {"log": L.log_loss, "brier": L.brier, "spherical": L.spherical, "rps": L.rps}
@@ -67,15 +70,17 @@ def distill_step(model, opt, b, teacher_probs, T=1.0):
     logits, ext = _fwd(model, b)
     return _step(model, opt, distill_loss(logits, ext, teacher_probs, T))
 
-def rl_step(model, opt, b, outcome_fn, samples=4):
-    """Stage 3. NOT replay-safe (torch.multinomial). (ONLY for outcome/bandit feedback): sample actions, reward r=c-p_a, leave-one-out baseline."""
+def rl_step(model, opt, b, outcome_fn, samples=4, *, seed: int, step: int):
+    """Stage 3, replay-safe: actions = Gumbel-max with Philox noise pure in (seed, step, b["ids"] row bytes, question).
+    RL only for outcome feedback; with labels use decision_loss/distill_loss (rlcd-research.md: CE>=proper>PG,
+    arXiv 2610.02486). Reward r=c-p_a, leave-one-out baseline (losses.bandit_rl)."""
     model.train()
     logits, _ = _fwd(model, b)
-    p = torch.softmax(logits, -1)
-    flat = p.reshape(-1, p.size(-1))
-    a = torch.multinomial(flat, samples, replacement=True)                 # [BQ, S]
+    B, Q, K = logits.shape
+    g = torch.from_numpy(rl_gumbel(b["ids"].cpu().numpy(), seed, step, Q, samples, K)).to(logits.device)
+    a = (logits.detach().double().unsqueeze(2) + g).argmax(-1).reshape(B * Q, samples)   # [BQ, S]
     lg = logits.reshape(-1, logits.size(-1)).unsqueeze(1).expand(-1, samples, -1)
-    correct = outcome_fn(a.reshape(*p.shape[:2], samples))                 # [B,Q,S] bool
+    correct = outcome_fn(a.reshape(B, Q, samples))                 # [B,Q,S] bool
     loss = L.bandit_rl(lg.reshape(-1, lg.size(-1)), a.reshape(-1), correct.reshape(-1))
     opt.zero_grad(); loss.backward(); opt.step()
     return loss.item()
