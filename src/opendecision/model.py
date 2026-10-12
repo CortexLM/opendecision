@@ -45,6 +45,7 @@ class ModelConfig:
     # `rtd_disc.*`. Generator = same Encoder class, same head dim, heads = round(ratio*heads), tied tok embeddings.
     rtd_gen_ratio: float = 0.0
     rtd_gen_layers: int = 0      # 0 = same as layers
+    freeze_log_temp: bool = False  # improvement D, stage C: log_temp.* detached in decide (no grads; set by calibrate)
 
 def gen_dims(cfg: ModelConfig) -> tuple[int, int, int]:
     """(d_gen, heads_gen, layers_gen): head dim kept (one RoPE table), heads = int(ratio*heads + 0.5) >= 1."""
@@ -390,7 +391,8 @@ class OpenDecisionModel(nn.Module):
         for layer in self.head:
             q = layer(q, opt_mask, h, hmask)
         logits = self.scorer(q).squeeze(-1)
-        t = torch.exp(oh.float() @ torch.stack([self.log_temp[k] for k in QTYPES])).unsqueeze(-1)
+        lt = torch.stack([self.log_temp[k] for k in QTYPES])
+        t = torch.exp(oh.float() @ (lt.detach() if self.cfg.freeze_log_temp else lt)).unsqueeze(-1)
         return (logits / t).masked_fill(~opt_mask, float("-inf")), opt_mask
 
     def forward(self, ids, mask, opt_ids, opt_mask, instr_ids, qtype):

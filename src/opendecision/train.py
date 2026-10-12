@@ -13,6 +13,7 @@ from .tokenizer import MASK
 RULES = {"log": L.log_loss, "brier": L.brier, "spherical": L.spherical, "rps": L.rps}
 
 RTD_LAMBDA = 50.0   # ELECTRA discriminator weight (arXiv 2003.10555)
+LABEL_TAU = 0.1     # label_negatives InfoNCE temperature (improvement D)
 
 def _attn_mask(ids, eos_id):
     """None (v1, packed rows attend everywhere) or the [B,N,N] document-boundary mask from masking.doc_mask."""
@@ -52,22 +53,55 @@ def rtd_loss(model, ids, positions, *, seed: int, eos_id=None, lam=RTD_LAMBDA, g
     disc = torch.nn.functional.binary_cross_entropy_with_logits(logit, (corrupt != ids).float())
     return gen + lam * disc
 
-def decision_loss(logits, opt_mask_ext, y, qtype, rule="log", rps_w=1.0):
+def decision_loss(logits, opt_mask_ext, y, qtype, rule="log", rps_w=1.0, brier_w=1.0):
     """Per-question losses, weighted (not compacted) so shapes stay constant. RPS on qtype==1, `rule` elsewhere.
-    The mask is already -inf in logits; opt_mask_ext is kept for signature symmetry with distill_loss."""
+    The mask is already -inf in logits; opt_mask_ext is kept for signature symmetry with distill_loss.
+    rule "ce_brier" (improvement D) = log loss + brier_w * Brier."""
     logits = logits.float()
     sel = qtype == 1
-    base = RULES[rule](logits, y, reduction="none")
+    if rule == "ce_brier":
+        base = L.ce_brier(logits, y, reduction="none", w=brier_w)
+    else:
+        base = RULES[rule](logits, y, reduction="none")
     ordl = L.rps(logits, y, reduction="none")
     z = torch.zeros_like(base)
     b = torch.where(~sel, base, z).sum() / (~sel).sum().clamp_min(1)
     o = torch.where(sel, ordl, z).sum() / sel.sum().clamp_min(1)
     return b + rps_w * o
 
-def distill_loss(logits, opt_mask_ext, teacher, T=1.0):
-    """KD from cached teacher distributions teacher [B,Q,K+1] (unknown included, padded = 0)."""
-    logp = torch.log_softmax(logits.float() / T, -1).masked_fill(~opt_mask_ext, 0)
-    return -(teacher.float() * logp).sum(-1).mean()
+def distill_loss(logits, opt_mask_ext, teacher, T=1.0, *, alpha=None, y=None, t2=False):
+    """KD from cached teacher distributions teacher [B,Q,K+1] (unknown included, padded = 0).
+    v1 (alpha None, t2 False): -sum teacher * log_softmax(logits/T), mean over B*Q.
+    t2 (improvement D, fixes W9): the teacher is tempered consistently, teacher^(1/T) renormalised, and KD is
+    scaled by T^2 (Hinton et al. 2015) so its gradient magnitude does not shrink with T.
+    alpha (improvement D): per question with a teacher label, alpha*KD + (1-alpha)*CE(y) at T=1; questions with
+    no teacher label (all zeros) take the CE term alone. y == K is the unknown slot."""
+    lf = logits.float()
+    tf = teacher.float()
+    if t2:
+        tp = tf.pow(1.0 / T)
+        tf = tp / tp.sum(-1, keepdim=True).clamp_min(1e-12)
+    logp = torch.log_softmax(lf / T, -1).masked_fill(~opt_mask_ext, 0)
+    kd = -(tf * logp).sum(-1) * (T * T if t2 else 1.0)
+    if alpha is None:
+        return kd.mean()
+    ce = L.log_loss(lf, y, reduction="none")
+    has_t = teacher.sum(-1) > 0
+    return torch.where(has_t, alpha * kd + (1 - alpha) * ce, ce).mean()
+
+def _pool(h, hmask):
+    """Masked mean over state positions (hmask None = all real)."""
+    if hmask is None:
+        return h.mean(1)
+    w = hmask.unsqueeze(-1).to(h.dtype)
+    return (h * w).sum(1) / w.sum(1).clamp_min(1)
+
+def label_negatives_loss(model, h, hmask, opt_ids, opt_mask, instr_ids, qtype, y, tau=LABEL_TAU):
+    """In-batch label negatives (improvement D, for K>8): anchor = instruction embedding + pooled state [B,Q,d],
+    candidates = every real option label embedding of the batch with the same qtype, positive = gold."""
+    opt = model.embed_text(opt_ids)
+    anchor = model.embed_text(instr_ids) + _pool(h, hmask).unsqueeze(1)
+    return L.label_contrastive(opt, y, tau, query=anchor, qtype=qtype, opt_mask=opt_mask, opt_ids=opt_ids)
 
 def _step(model, opt, loss):
     opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
@@ -76,11 +110,19 @@ def _step(model, opt, loss):
 def _fwd(model, b):
     return model(b["ids"], b["mask"], b["opt_ids"], b["opt_mask"], b["instr_ids"], b["qtype"])
 
-def finetune_step(model, opt, b, rule="log", rps_w=1.0, coh=None, coh_w=0.1):
-    """Supervised strictly-proper loss (stage 2). `coh` = optional callable(model,b)->loss for coherence."""
+def finetune_step(model, opt, b, rule="log", rps_w=1.0, coh=None, coh_w=0.1, *, brier_w=1.0, label_neg=0.0):
+    """Supervised strictly-proper loss (stage 2). `coh` = optional callable(model,b)->loss for coherence.
+    label_neg > 0 adds label_neg * label_negatives_loss (improvement D)."""
     model.train()
-    logits, ext = _fwd(model, b)
-    loss = decision_loss(logits, ext, b["y"], b["qtype"], rule, rps_w)
+    if label_neg:
+        h, hm = model.encode_state(b["ids"], b["mask"])
+        logits, ext = model.decide(h, hm, b["opt_ids"], b["opt_mask"], b["instr_ids"], b["qtype"])
+    else:
+        logits, ext = _fwd(model, b)
+    loss = decision_loss(logits, ext, b["y"], b["qtype"], rule, rps_w, brier_w)
+    if label_neg:
+        loss = loss + label_neg * label_negatives_loss(
+            model, h, hm, b["opt_ids"], b["opt_mask"], b["instr_ids"], b["qtype"], b["y"])
     if coh is not None:
         loss = loss + coh_w * coh(model, b)
     return _step(model, opt, loss)
@@ -95,11 +137,11 @@ def rtd_step(model, opt, ids, positions, *, seed: int, eos_id=None):
     model.train()
     return _step(model, opt, rtd_loss(model, ids, positions, seed=seed, eos_id=eos_id))
 
-def distill_step(model, opt, b, teacher_probs, T=1.0):
-    """Stage 1: KD from cached (offline) teacher distributions [B,Q,K+1]."""
+def distill_step(model, opt, b, teacher_probs, T=1.0, *, alpha=None, t2=False):
+    """Stage 1: KD from cached (offline) teacher distributions [B,Q,K+1]; alpha/t2 see distill_loss."""
     model.train()
     logits, ext = _fwd(model, b)
-    return _step(model, opt, distill_loss(logits, ext, teacher_probs, T))
+    return _step(model, opt, distill_loss(logits, ext, teacher_probs, T, alpha=alpha, y=b.get("y"), t2=t2))
 
 def rl_step(model, opt, b, outcome_fn, samples=4, *, seed: int, step: int):
     """Stage 3, replay-safe: actions = Gumbel-max with Philox noise pure in (seed, step, b["ids"] row bytes, question).
