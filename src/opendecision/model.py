@@ -55,6 +55,11 @@ class ModelConfig:
     router_z_coef: float = 1e-3   # ST-MoE z-loss (2202.08906)
     aux_coef: float = 0.01        # Switch load-balance loss (2101.03961)
     capacity_factor: float = 1.25
+    # alternating local/global attention (improvement H, ModernBERT arXiv 2412.13663): local_window > 0 makes encoder
+    # blocks with i % global_every != 0 attend a sliding band |i-j| <= local_window//2; the others stay global and
+    # use global_theta RoPE. 0 = off (v1).
+    local_window: int = 0
+    global_every: int = 3
 
 def gen_dims(cfg: ModelConfig) -> tuple[int, int, int]:
     """(d_gen, heads_gen, layers_gen): head dim kept (one RoPE table), heads = int(ratio*heads + 0.5) >= 1."""
@@ -129,6 +134,14 @@ class SwiGLU(nn.Module):
 
     def forward(self, x):
         return self.down(F.silu(self.gate(x)) * self.up(x))
+
+def local_mask(mask: torch.Tensor | None, n: int, window: int, device) -> torch.Tensor:
+    """H: bool [B|1,N,N] = (mask as key padding [B,N] / doc mask [B,N,N] / None) AND band |i-j| <= window//2,
+    plus the diagonal so a padded query row never has every key masked (finite SDPA output)."""
+    i = torch.arange(n, device=device)
+    band = (i[:, None] - i[None, :]).abs() <= window // 2
+    m = band[None] if mask is None else (mask if mask.dim() == 3 else mask[:, None, :]) & band
+    return m | torch.eye(n, dtype=torch.bool, device=device)
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """x [B,H,N,hd]; cos/sin [N,hd/2] (rotate-half)."""
@@ -206,15 +219,23 @@ class Block(nn.Module):
         return y.view(k, n, d).sum(0).view(B, N, d)
 
 class Encoder(nn.Module):
-    def __init__(self, d, heads, layers, block="v1", attn_gate="none", moe: ModelConfig | None = None):
+    def __init__(self, d, heads, layers, block="v1", attn_gate="none", moe: ModelConfig | None = None,
+                 local_window=0, global_every=3):
         super().__init__()
         ml = set(moe_layers(moe)) if moe is not None else set()
         self.blocks = nn.ModuleList([Block(d, heads, block, attn_gate, moe if i in ml else None) for i in range(layers)])
         self.norm = nn.LayerNorm(d) if block == "v1" else RMSNorm(d)
+        self.local_window, self.global_every = local_window, global_every
 
-    def forward(self, x, mask, cos, sin):
-        for b in self.blocks:
-            x = b(x, mask, cos, sin)
+    def forward(self, x, mask, cos, sin, glob=None):
+        """glob = (cos, sin) at global_theta for the global layers when local_window > 0 (H)."""
+        if not self.local_window:
+            for b in self.blocks:
+                x = b(x, mask, cos, sin)
+            return self.norm(x)
+        lm = local_mask(mask, x.size(1), self.local_window, x.device)
+        for i, b in enumerate(self.blocks):
+            x = b(x, lm, cos, sin) if i % self.global_every else b(x, mask, *glob)
         return self.norm(x)
 
 class Generator(nn.Module):
@@ -349,7 +370,7 @@ class OpenDecisionModel(nn.Module):
         self.tok = TokEmbed(c.vocab, c.d, embed_fn)
         if c.emb_norm:
             self.emb_norm = nn.LayerNorm(c.d)
-        self.encoder = Encoder(c.d, c.heads, c.layers, c.block, c.attn_gate, c)
+        self.encoder = Encoder(c.d, c.heads, c.layers, c.block, c.attn_gate, c, c.local_window, c.global_every)
         cos, sin = self._table(c.max_len, c.rope_theta)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
@@ -365,6 +386,7 @@ class OpenDecisionModel(nn.Module):
             self.chunk_q = nn.Parameter(torch.randn(c.chunk_latents, c.d) * 0.02)
             self.chunk_pool = Attention(c.d, c.heads)
             self.global_enc = Encoder(c.d, c.heads, c.global_layers, c.block, c.attn_gate)
+        if c.chunk or c.local_window:
             gcos, gsin = self._table(c.max_len, c.global_theta)
             self.register_buffer("rope_gcos", gcos, persistent=False)
             self.register_buffer("rope_gsin", gsin, persistent=False)
@@ -393,6 +415,10 @@ class OpenDecisionModel(nn.Module):
             return cos[:n], sin[:n]
         return self._table(n, c.global_theta if glob else c.rope_theta)
 
+    def _enc(self, x, mask, n):
+        """Main encoder at length n (global-theta table only when local/global attention is on)."""
+        return self.encoder(x, mask, *self._rope(n), glob=self._rope(n, glob=True) if self.cfg.local_window else None)
+
     # ---- stage 1: encode state once ----------------------------------------------------
     def _chunks(self, ids, mask):
         c = self.cfg
@@ -403,7 +429,7 @@ class OpenDecisionModel(nn.Module):
         x = self._embed(ids).reshape(B * nc, c.chunk, -1)
         m = mask.reshape(B * nc, c.chunk)
         m = m | (~m.any(1, keepdim=True) & (torch.arange(c.chunk, device=ids.device) == 0))  # empty chunk stays finite
-        h = self.encoder(x, m, *self._rope(c.chunk))
+        h = self._enc(x, m, c.chunk)
         return h, m, mask, B, nc
 
     def encode_tokens(self, ids, mask=None):
@@ -413,7 +439,7 @@ class OpenDecisionModel(nn.Module):
                 mask = torch.ones_like(ids, dtype=torch.bool)
             h, _, _, B, nc = self._chunks(ids, mask)
             return h.reshape(B, nc * self.cfg.chunk, -1)[:, : ids.size(1)]
-        return self.encoder(self._embed(ids), mask, *self._rope(ids.size(1)))
+        return self._enc(self._embed(ids), mask, ids.size(1))
 
     def encode_state(self, ids, mask=None):
         c = self.cfg
@@ -440,7 +466,7 @@ class OpenDecisionModel(nn.Module):
         flat = ids.reshape(-1, T)
         m = flat != PAD
         m[:, 0] = True
-        h = self.encoder(self._embed(flat), m, *self._rope(T))
+        h = self._enc(self._embed(flat), m, T)
         w = m.unsqueeze(-1).to(h.dtype)
         return ((h * w).sum(1) / w.sum(1)).view(*sh, -1)
 
